@@ -141,28 +141,29 @@ rm -f /etc/resolv.conf
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
-# 2. Install dependencies
+# 2. Install dependencies (ultra-fast, no snapd required)
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y git curl wget snapd build-essential
+apt-get install -y git curl wget
 
 # 3. Install optimized dnstt-server
 mkdir -p /usr/local/bin
-echo "Fetching dnstt-server binary..."
-curl -fsSL --connect-timeout 5 -m 30 "https://raw.githubusercontent.com/foridul422/gcp-slowdns-v2ray/main/dnstt-server" -o /usr/local/bin/dnstt-server 2>/dev/null && chmod +x /usr/local/bin/dnstt-server || true
-
 if [ ! -x /usr/local/bin/dnstt-server ] || [ $(stat -c%s /usr/local/bin/dnstt-server 2>/dev/null || echo 0) -lt 1000000 ]; then
-    echo "Prebuilt binary not found, building from source with optimizations..."
-    snap install go --classic
-    export PATH="$PATH:/snap/bin"
+    echo "Installing Go compiler (standalone, ultra-fast)..."
+    wget -q https://go.dev/dl/go1.22.4.linux-amd64.tar.gz -O /tmp/go.tar.gz
+    tar -C /usr/local -xzf /tmp/go.tar.gz
+    rm -f /tmp/go.tar.gz
+
+    echo "Building optimized dnstt-server from source..."
     rm -rf /tmp/dnstt
     git clone https://www.bamsoftware.com/git/dnstt.git /tmp/dnstt
     sed -i 's/const QueueSize = 128/const QueueSize = 2048/g' /tmp/dnstt/turbotunnel/consts.go
     sed -i 's/maxResponseDelay = 1 \* time.Second/maxResponseDelay = 50 \* time.Millisecond/g' /tmp/dnstt/dnstt-server/main.go
     sed -i 's/ch := make(chan \*record, 100)/ch := make(chan \*record, 10000)/g' /tmp/dnstt/dnstt-server/main.go
     cd /tmp/dnstt/dnstt-server
-    /snap/bin/go build -ldflags="-s -w" -o /usr/local/bin/dnstt-server .
+    /usr/local/go/bin/go build -ldflags="-s -w" -o /usr/local/bin/dnstt-server .
     chmod +x /usr/local/bin/dnstt-server
+    rm -rf /tmp/dnstt /usr/local/go
 fi
 echo "[OK] dnstt-server installed successfully"
 
@@ -390,8 +391,8 @@ else
 fi
 
 # ============ Step 6: Wait for Setup ============
-log_step "Waiting for software installation on VM (3-5 minutes)..."
-log_info "Building dnstt-server from source + installing Xray..."
+log_step "Waiting for software installation on VM (takes ~45-60s)..."
+log_info "Compiling optimized dnstt-server + configuring Xray..."
 
 for i in $(seq 1 30); do
     DONE=$(gcloud compute ssh "$VM_NAME" --zone="$DEPLOYED_ZONE" --project="$PROJECT_ID" \
@@ -401,10 +402,10 @@ for i in $(seq 1 30); do
         log_step "Setup complete! ✅"
         break
     fi
-    if [ $((i % 6)) -eq 0 ]; then
-        log_info "Still installing... ($((i*10))s elapsed)"
+    if [ $((i % 3)) -eq 0 ]; then
+        log_info "Installing... ($((i*5))s elapsed)"
     fi
-    sleep 10
+    sleep 5
 done
 
 # Verify services
