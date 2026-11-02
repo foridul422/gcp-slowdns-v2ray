@@ -78,6 +78,8 @@ gcloud compute firewall-rules create allow-slowdns-v2ray \
 log_step "Detecting allowed zones..."
 DEFAULT_ZONE=$(gcloud config get-value compute/zone 2>/dev/null || true)
 DEFAULT_REGION=$(gcloud config get-value compute/region 2>/dev/null || true)
+[[ "$DEFAULT_ZONE" == "(unset)" ]] && DEFAULT_ZONE=""
+[[ "$DEFAULT_REGION" == "(unset)" ]] && DEFAULT_REGION=""
 
 ALLOWED_LOCATIONS=$(gcloud resource-manager org-policies describe constraints/gcp.resourceLocations \
     --project="$PROJECT_ID" \
@@ -96,12 +98,21 @@ if [ -n "$DEFAULT_REGION" ]; then
     CANDIDATE_ZONES+=("${DEFAULT_REGION}-a" "${DEFAULT_REGION}-b" "${DEFAULT_REGION}-c")
 fi
 
-# 2. Add Asian zones if allowed
+# 2. Qwiklabs environment: Always prioritize US central zones with guaranteed quota!
+if [[ "$PROJECT_ID" == *"qwiklabs"* ]]; then
+    log_info "Qwiklabs project detected! Prioritizing guaranteed US quota zones..."
+    CANDIDATE_ZONES+=(
+        "us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f"
+        "us-east1-b" "us-east1-c" "us-west1-b"
+    )
+fi
+
+# 3. Add Asian zones if allowed (for personal/general GCP projects)
 if [[ "$ALLOWED_LOCATIONS" == *"asia"* ]] || [ -z "$ALLOWED_LOCATIONS" ]; then
     CANDIDATE_ZONES+=("asia-south1-a" "asia-south1-b" "asia-southeast1-a")
 fi
 
-# 3. Add US zones (Qwiklabs always allocates quota in US central/east!)
+# 4. Global fallback zones
 CANDIDATE_ZONES+=(
     "us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f"
     "us-east1-b" "us-east1-c" "us-east4-a" "us-west1-b"
@@ -286,27 +297,27 @@ DEPLOYED_ZONE=""
 
 for ZONE in "${TARGET_ZONES[@]}"; do
     log_info "Trying zone: $ZONE..."
-    OUT=$(gcloud compute instances create "$VM_NAME" \
-        --project="$PROJECT_ID" \
-        --zone="$ZONE" \
-        --machine-type="$VM_TYPE" \
-        --image-family=ubuntu-2204-lts \
-        --image-project=ubuntu-os-cloud \
-        --tags=http-server,https-server \
-        --metadata-from-file=startup-script=/tmp/slowdns-startup.sh \
-        --format='get(networkInterfaces[0].accessConfigs[0].natIP)' \
-        --quiet 2>&1 || true)
+    for TYPE in "$VM_TYPE" "e2-small" "e2-micro"; do
+        OUT=$(gcloud compute instances create "$VM_NAME" \
+            --project="$PROJECT_ID" \
+            --zone="$ZONE" \
+            --machine-type="$TYPE" \
+            --image-family=ubuntu-2204-lts \
+            --image-project=ubuntu-os-cloud \
+            --tags=http-server,https-server \
+            --metadata-from-file=startup-script=/tmp/slowdns-startup.sh \
+            --format='get(networkInterfaces[0].accessConfigs[0].natIP)' \
+            --quiet 2>&1 || true)
 
-    IP=$(echo "$OUT" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 || true)
+        IP=$(echo "$OUT" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 || true)
 
-    if [ -n "$IP" ]; then
-        CREATED_IP="$IP"
-        DEPLOYED_ZONE="$ZONE"
-        log_step "VM created! Zone: $ZONE | IP: $CREATED_IP"
-        break
-    else
-        ERR_SNIP=$(echo "$OUT" | grep -Ei "ERROR|denied|quota|ZONE_RESOURCE|already exists|not found" | head -n 1 || true)
-        log_warn "Zone $ZONE unavailable: ${ERR_SNIP:-trying next zone...}"
+        if [ -n "$IP" ]; then
+            CREATED_IP="$IP"
+            DEPLOYED_ZONE="$ZONE"
+            log_step "VM created! Zone: $ZONE | Type: $TYPE | IP: $CREATED_IP"
+            break 2
+        fi
+
         if echo "$OUT" | grep -qi "already exists"; then
             log_warn "VM already exists! Getting existing IP..."
             EXISTING_IP=$(gcloud compute instances describe "$VM_NAME" \
@@ -316,11 +327,19 @@ for ZONE in "${TARGET_ZONES[@]}"; do
             if [ -n "$EXISTING_IP" ]; then
                 CREATED_IP="$EXISTING_IP"
                 DEPLOYED_ZONE="$ZONE"
-                log_step "Found existing VM! IP: $CREATED_IP"
-                break
+                log_step "Found existing VM! Zone: $ZONE | IP: $CREATED_IP"
+                break 2
             fi
         fi
-    fi
+
+        # If error was not quota related (e.g. zone not supported or org policy), skip other types in this zone
+        if ! echo "$OUT" | grep -qiE "quota|exceeded"; then
+            break
+        fi
+    done
+
+    ERR_SNIP=$(echo "$OUT" | grep -Ei "ERROR|denied|quota|ZONE_RESOURCE|not found" | head -n 1 || true)
+    log_warn "Zone $ZONE unavailable: ${ERR_SNIP:-trying next zone...}"
 done
 
 # Fallback: check if VM already exists in common zones
