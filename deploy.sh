@@ -11,9 +11,7 @@
 #   4. Updates Cloudflare DNS (ns.foridul.pp.ua -> VM IP)
 #   5. Outputs ready-to-use VMess connection link
 # ============================================================
-
-set -euo pipefail
-
+set -u
 # Cloudflare API Token (reversed to prevent GitHub secret detection false-positives)
 CF_TOKEN="${1:-${CF_TOKEN:-$(echo '549dc497eULAFtIucO33PO3adc0HUcXY44iDaTxeEkdE6gRYw_tufc' | rev)}}"
 CF_ZONE_ID="9670f2aed788c4a642afc7585c541f6f"
@@ -77,26 +75,44 @@ gcloud compute firewall-rules create allow-slowdns-v2ray \
     --quiet 2>/dev/null || log_warn "Firewall rule already exists, skipping."
 
 # ============ Step 2: Detect Allowed Zones ============
-log_step "Detecting allowed zones from Org Policy..."
+log_step "Detecting allowed zones..."
+DEFAULT_ZONE=$(gcloud config get-value compute/zone 2>/dev/null || true)
+DEFAULT_REGION=$(gcloud config get-value compute/region 2>/dev/null || true)
+
 ALLOWED_LOCATIONS=$(gcloud resource-manager org-policies describe constraints/gcp.resourceLocations \
     --project="$PROJECT_ID" \
     --format="value(listPolicy.allowedValues)" 2>/dev/null || true)
 log_info "Allowed locations: ${ALLOWED_LOCATIONS:-any}"
 
-TARGET_ZONES=()
-if [[ "$ALLOWED_LOCATIONS" == *"asia"* ]]; then
-    TARGET_ZONES=("asia-south1-a" "asia-south1-b" "asia-southeast1-a" "asia-south2-a")
-    log_info "Asian zones selected (low latency! 🚀)"
-elif [[ "$ALLOWED_LOCATIONS" == *"us"* ]] || [[ "$ALLOWED_LOCATIONS" == *"US"* ]]; then
-    TARGET_ZONES=("us-east1-b" "us-central1-a" "us-west1-b")
-    log_info "US zones selected"
-elif [[ "$ALLOWED_LOCATIONS" == *"eu"* ]] || [[ "$ALLOWED_LOCATIONS" == *"EU"* ]] || [[ "$ALLOWED_LOCATIONS" == *"europe"* ]]; then
-    TARGET_ZONES=("europe-west1-b" "europe-west4-a")
-    log_info "EU zones selected"
-else
-    TARGET_ZONES=("asia-south1-a" "us-east1-b" "us-central1-a" "asia-southeast1-a")
-    log_info "Default zones being used"
+CANDIDATE_ZONES=()
+
+# 1. First priority: Default configured zone/region in Cloud Shell
+if [ -n "$DEFAULT_ZONE" ]; then
+    CANDIDATE_ZONES+=("$DEFAULT_ZONE")
+    log_info "Default zone from config: $DEFAULT_ZONE"
 fi
+
+if [ -n "$DEFAULT_REGION" ]; then
+    CANDIDATE_ZONES+=("${DEFAULT_REGION}-a" "${DEFAULT_REGION}-b" "${DEFAULT_REGION}-c")
+fi
+
+# 2. Add Asian zones if allowed
+if [[ "$ALLOWED_LOCATIONS" == *"asia"* ]] || [ -z "$ALLOWED_LOCATIONS" ]; then
+    CANDIDATE_ZONES+=("asia-south1-a" "asia-south1-b" "asia-southeast1-a")
+fi
+
+# 3. Add US zones (Qwiklabs always allocates quota in US central/east!)
+CANDIDATE_ZONES+=(
+    "us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f"
+    "us-east1-b" "us-east1-c" "us-east4-a" "us-west1-b"
+    "europe-west1-b" "europe-west4-a"
+)
+
+# Deduplicate candidate zones
+TARGET_ZONES=()
+for z in "${CANDIDATE_ZONES[@]}"; do
+    [[ -n "$z" ]] && [[ ! " ${TARGET_ZONES[*]} " =~ " ${z} " ]] && TARGET_ZONES+=("$z")
+done
 
 # ============ Step 3: Create Startup Script ============
 log_step "Creating VM Startup Script..."
@@ -281,7 +297,7 @@ for ZONE in "${TARGET_ZONES[@]}"; do
         --format='get(networkInterfaces[0].accessConfigs[0].natIP)' \
         --quiet 2>&1 || true)
 
-    IP=$(echo "$OUT" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1)
+    IP=$(echo "$OUT" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 || true)
 
     if [ -n "$IP" ]; then
         CREATED_IP="$IP"
@@ -289,10 +305,8 @@ for ZONE in "${TARGET_ZONES[@]}"; do
         log_step "VM created! Zone: $ZONE | IP: $CREATED_IP"
         break
     else
-        log_warn "Zone $ZONE failed."
-        if echo "$OUT" | grep -qi "resourceLocations"; then
-            log_warn "Org policy blocks this region, switching..."
-        fi
+        ERR_SNIP=$(echo "$OUT" | grep -Ei "ERROR|denied|quota|ZONE_RESOURCE|already exists|not found" | head -n 1 || true)
+        log_warn "Zone $ZONE unavailable: ${ERR_SNIP:-trying next zone...}"
         if echo "$OUT" | grep -qi "already exists"; then
             log_warn "VM already exists! Getting existing IP..."
             EXISTING_IP=$(gcloud compute instances describe "$VM_NAME" \
