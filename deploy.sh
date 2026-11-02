@@ -334,18 +334,26 @@ fi
 # ============ Step 5: Update Cloudflare DNS ============
 log_step "Updating Cloudflare DNS: $CF_RECORD_NAME -> $CREATED_IP"
 
-CF_RESPONSE=$(curl -s -X PATCH \
-    "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$CF_RECORD_ID" \
-    -H "Authorization: Bearer $CF_TOKEN" \
-    -H "Content-Type: application/json" \
-    --data "{\"type\":\"A\",\"name\":\"$CF_RECORD_NAME\",\"content\":\"$CREATED_IP\",\"ttl\":60,\"proxied\":false}")
+CF_SUCCESS=""
+if [ -n "${CF_TOKEN:-}" ]; then
+    CF_RESPONSE=$(curl -s -X PATCH \
+        "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$CF_RECORD_ID" \
+        -H "Authorization: Bearer $CF_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"A\",\"name\":\"$CF_RECORD_NAME\",\"content\":\"$CREATED_IP\",\"ttl\":60,\"proxied\":false}" || true)
 
-CF_SUCCESS=$(echo "$CF_RESPONSE" | grep -o '"success":true' || true)
+    CF_SUCCESS=$(echo "$CF_RESPONSE" | grep -o '"success":true' || true)
+fi
+
 if [ -n "$CF_SUCCESS" ]; then
-    log_step "Cloudflare DNS updated successfully! ✅"
+    log_step "Cloudflare DNS updated successfully! ✅ ($CF_RECORD_NAME -> $CREATED_IP)"
 else
-    log_warn "Cloudflare update may have issues. Check manually."
-    echo "$CF_RESPONSE"
+    log_warn "Cloudflare API update skipped or token needs renewal."
+    echo -e "${YELLOW}👉 Please update your Cloudflare DNS manually:${NC}"
+    echo -e "   • Record Type: ${BOLD}A${NC}"
+    echo -e "   • Name:        ${BOLD}$CF_RECORD_NAME${NC}"
+    echo -e "   • IPv4 Target: ${CYAN}${BOLD}$CREATED_IP${NC}"
+    echo -e "   • Proxy status: ${BOLD}DNS only (Grey Cloud / OFF)${NC}"
 fi
 
 # ============ Step 6: Wait for Setup ============
@@ -384,7 +392,11 @@ echo -e "${BOLD}🌐 Server Details:${NC}"
 echo -e "   • Project:      ${CYAN}$PROJECT_ID${NC}"
 echo -e "   • Zone:         ${CYAN}$DEPLOYED_ZONE${NC}"
 echo -e "   • Server IP:    ${CYAN}$CREATED_IP${NC}"
-echo -e "   • DNS Updated:  ${GREEN}$CF_RECORD_NAME → $CREATED_IP ✅${NC}"
+if [ -n "$CF_SUCCESS" ]; then
+    echo -e "   • DNS Status:   ${GREEN}$CF_RECORD_NAME → $CREATED_IP ✅${NC}"
+else
+    echo -e "   • DNS Status:   ${YELLOW}MANUAL: Point $CF_RECORD_NAME → $CREATED_IP${NC}"
+fi
 echo ""
 echo -e "${BOLD}🔑 SlowDNS Config (HTTP Custom / Netmod):${NC}"
 echo -e "   • NS Domain:    ${CYAN}$NS_DOMAIN${NC}"
