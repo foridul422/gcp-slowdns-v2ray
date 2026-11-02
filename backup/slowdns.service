@@ -1,0 +1,15 @@
+[Unit]
+Description=SlowDNS DNSTT Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file /etc/slowdns/server.key dns.foridul.pp.ua 127.0.0.1:10086
+Restart=always
+RestartSec=3
+LimitNOFILE=1000000
+LimitNPROC=100000
+
+[Install]
+WantedBy=multi-user.target
