@@ -171,137 +171,161 @@ cat > /tmp/slowdns-startup.sh << 'STARTUP_EOF'
 #!/bin/bash
 set -e
 exec > /var/log/slowdns-setup.log 2>&1
-echo "=== [$(date)] SlowDNS + V2Ray Setup Starting ==="
+echo "=== [$(date)] SlowDNS + V2Ray Fresh Setup Starting ==="
 
-# 1. Free Port 53
+# 1. Critical environment for non-login systemd execution
+export HOME=/root
+export GOPATH=/root/go
+export GOMODCACHE=/root/go/pkg/mod
+export PATH=$PATH:/usr/local/go/bin
+export DEBIAN_FRONTEND=noninteractive
+
+# 2. Build optimized dnstt-server (pure Go, CGO disabled - takes ~10 seconds)
+mkdir -p /usr/local/bin
+if [ ! -x /usr/local/bin/dnstt-server ] || [ $(stat -c%s /usr/local/bin/dnstt-server 2>/dev/null || echo 0) -lt 1000000 ]; then
+    echo "[*] Downloading standalone Go compiler..."
+    wget -q https://go.dev/dl/go1.22.4.linux-amd64.tar.gz -O /tmp/go.tar.gz
+    tar -C /usr/local -xzf /tmp/go.tar.gz
+    rm -f /tmp/go.tar.gz
+
+    echo "[*] Downloading and patching dnstt source for maximum speed..."
+    rm -rf /tmp/dnstt
+    git clone https://www.bamsoftware.com/git/dnstt.git /tmp/dnstt
+    sed -i 's/const QueueSize = 128/const QueueSize = 2048/g' /tmp/dnstt/turbotunnel/consts.go
+    sed -i 's/maxResponseDelay = 1 \* time.Second/maxResponseDelay = 50 \* time.Millisecond/g' /tmp/dnstt/dnstt-server/main.go
+    sed -i 's/ch := make(chan \*record, 100)/ch := make(chan \*record, 10000)/g' /tmp/dnstt/dnstt-server/main.go
+
+    echo "[*] Compiling dnstt-server..."
+    cd /tmp/dnstt/dnstt-server
+    CGO_ENABLED=0 /usr/local/go/bin/go build -ldflags="-s -w" -o /usr/local/bin/dnstt-server .
+    chmod +x /usr/local/bin/dnstt-server
+    rm -rf /tmp/dnstt /usr/local/go /root/go
+    echo "[OK] dnstt-server compiled successfully"
+fi
+
+# 3. SlowDNS Permanent Keys
+mkdir -p /etc/slowdns
+echo "PRIVKEY_PLACEHOLDER" > /etc/slowdns/server.key
+echo "PUBKEY_PLACEHOLDER" > /etc/slowdns/server.pub
+chmod 600 /etc/slowdns/server.key
+
+# 4. Install Xray (V2Ray core)
+echo "[*] Installing Xray core..."
+curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- install
+mkdir -p /usr/local/etc/xray
+
+cat > /usr/local/etc/xray/config.json << 'XRAY_CONFIG'
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": PORT_PLACEHOLDER,
+    "protocol": "vmess",
+    "settings": {
+      "clients": [{"id": "UUID_PLACEHOLDER", "alterId": 0}]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "sockopt": {
+        "tcpFastOpen": true,
+        "tcpNoDelay": true,
+        "tcpKeepAliveInterval": 15
+      }
+    }
+  }],
+  "outbounds": [{
+    "protocol": "freedom",
+    "settings": {"domainStrategy": "UseIP"}
+  }]
+}
+XRAY_CONFIG
+echo "[OK] Xray configured"
+
+# 5. SlowDNS Systemd Service
+cat > /etc/systemd/system/slowdns.service << 'SVC_EOF'
+[Unit]
+Description=SlowDNS DNSTT Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file /etc/slowdns/server.key DOMAIN_PLACEHOLDER 127.0.0.1:PORT2_PLACEHOLDER
+Restart=always
+RestartSec=3
+LimitNOFILE=1000000
+LimitNPROC=100000
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+
+# 6. Kernel & Network Buffer Tuning (64MB UDP + BBR)
+cat > /etc/sysctl.d/99-slowdns-tune.conf << 'SYSCTL_EOF'
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=33554432
+net.core.wmem_default=33554432
+net.core.netdev_max_backlog=100000
+net.core.somaxconn=65535
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.ip_local_port_range=1024 65535
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+fs.file-max=1000000
+SYSCTL_EOF
+sysctl -p /etc/sysctl.d/99-slowdns-tune.conf 2>/dev/null || true
+
+for iface in ens4 eth0; do
+    ip link set "$iface" txqueuelen 10000 2>/dev/null || true
+done
+
+# 7. Enable SSH password auth & create user
+mkdir -p /etc/ssh/sshd_config.d/
+cat > /etc/ssh/sshd_config.d/01-allow-password.conf << 'SSHCFG'
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PermitRootLogin yes
+SSHCFG
+sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+sed -i 's/.*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+
+id -u foridul &>/dev/null || useradd -m -s /bin/bash foridul
+echo "foridul:foridul123" | chpasswd
+echo "root:Foridul4.22" | chpasswd
+usermod -aG sudo foridul 2>/dev/null || true
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+
+# 8. Free Port 53 right before starting SlowDNS (so downloads were never affected)
 systemctl stop systemd-resolved 2>/dev/null || true
 systemctl disable systemd-resolved 2>/dev/null || true
 rm -f /etc/resolv.conf
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
-# 2. Install dependencies (fast, non-interactive)
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y git curl wget build-essential iptables
-
-# 3. Fast Standalone Go Install (~10s instead of snap 2+ mins)
-GO_TAR="go1.22.4.linux-amd64.tar.gz"
-wget -q "https://go.dev/dl/${GO_TAR}" -O /tmp/${GO_TAR}
-rm -rf /usr/local/go
-tar -C /usr/local -xzf /tmp/${GO_TAR}
-rm -f /tmp/${GO_TAR}
-export PATH=$PATH:/usr/local/go/bin
-
-# 4. Build dnstt-server from source with speed patches
-rm -rf /tmp/dnstt
-git clone https://www.bamsoftware.com/git/dnstt.git /tmp/dnstt
-
-sed -i 's/const QueueSize = 128/const QueueSize = 2048/g' /tmp/dnstt/turbotunnel/consts.go
-sed -i 's/maxResponseDelay = 1 \* time.Second/maxResponseDelay = 50 \* time.Millisecond/g' /tmp/dnstt/dnstt-server/main.go
-sed -i 's/ch := make(chan \*record, 100)/ch := make(chan \*record, 10000)/g' /tmp/dnstt/dnstt-server/main.go
-
-cd /tmp/dnstt/dnstt-server
-/usr/local/go/bin/go build -ldflags="-s -w" -o /usr/local/bin/dnstt-server .
-chmod +x /usr/local/bin/dnstt-server
-echo "[OK] dnstt-server built successfully"
-
-# 5. SlowDNS Keys (permanent)
-mkdir -p /etc/slowdns
-echo "PRIVKEY_PLACEHOLDER" > /etc/slowdns/server.key
-echo "PUBKEY_PLACEHOLDER" > /etc/slowdns/server.pub
-chmod 600 /etc/slowdns/server.key
-
-# 6. Install Xray (V2Ray core)
-curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- install
-mkdir -p /usr/local/etc/xray
-
-# 7. Write Xray VMess Config
-cat > /usr/local/etc/xray/config.json << 'XRAY_CONF'
-{
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "port": 10086,
-      "listen": "127.0.0.1",
-      "protocol": "vmess",
-      "settings": {
-        "clients": [
-          {
-            "id": "UUID_PLACEHOLDER",
-            "alterId": 0
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "tcp"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    }
-  ]
-}
-XRAY_CONF
-
-# 8. Create SlowDNS systemd Service
-cat > /etc/systemd/system/slowdns.service << 'SERVICE_CONF'
-[Unit]
-Description=SlowDNS dnstt-server
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/dnstt-server -gen-key -udp :53 -privkey-file /etc/slowdns/server.key DOMAIN_PLACEHOLDER 127.0.0.1:PORT_PLACEHOLDER
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-SERVICE_CONF
-
-# 9. Kernel tuning for high UDP/DNS throughput
-cat > /etc/sysctl.d/99-slowdns-tune.conf << 'SYSCTL_EOF'
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 33554432
-net.core.wmem_default = 33554432
-net.core.netdev_max_backlog = 100000
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq
-SYSCTL_EOF
-sysctl --system 2>/dev/null || true
-
-# 10. Configure SSH for slowdns tunneling
-sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config 2>/dev/null || true
-sed -i 's/.*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config 2>/dev/null || true
-id -u foridul &>/dev/null || useradd -m -s /bin/bash foridul
-echo "foridul:foridul123" | chpasswd
-echo "root:Foridul4.22" | chpasswd
-systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-
-# 11. Start and enable all services
+# 9. Start Services
 systemctl daemon-reload
-systemctl enable xray slowdns
-systemctl restart xray
-systemctl restart slowdns
+systemctl enable xray && systemctl restart xray
+systemctl enable slowdns && systemctl restart slowdns
+sleep 2
 
-# 12. Done marker
+echo "=== [$(date)] SETUP COMPLETE ==="
+systemctl status slowdns --no-pager || true
+systemctl status xray --no-pager || true
+
+# Signal completion
 touch /tmp/slowdns-setup-done
-echo "=== [$(date)] Setup Finished Successfully ==="
 STARTUP_EOF
 
-# Replace placeholders
+# Replace placeholders in startup script
 sed -i "s|PRIVKEY_PLACEHOLDER|$SLOWDNS_PRIVKEY|g" /tmp/slowdns-startup.sh
 sed -i "s|PUBKEY_PLACEHOLDER|$SLOWDNS_PUBKEY|g" /tmp/slowdns-startup.sh
 sed -i "s|UUID_PLACEHOLDER|$VMESS_UUID|g" /tmp/slowdns-startup.sh
@@ -356,7 +380,6 @@ for ZONE in "${TARGET_ZONES[@]}"; do
             fi
         fi
 
-        # If error was not quota related (e.g. zone not supported or org policy), skip other types in this zone
         if ! echo "$OUT" | grep -qiE "quota|exceeded"; then
             break
         fi
@@ -393,7 +416,7 @@ fi
 send_tg "🌐 *VM Created Successfully!*
 📍 *Zone:* \`$DEPLOYED_ZONE\`
 🖥️ *Server IP:* \`$CREATED_IP\`
-⚙️ Compiling optimized \`dnstt-server\` & configuring Xray VMess (~45-60s)..."
+⚙️ Compiling optimized \`dnstt-server\` & configuring Xray VMess (~20-25s)..."
 
 # ============ Step 5: Update Cloudflare DNS ============
 log_step "Updating Cloudflare DNS: $CF_RECORD_NAME -> $CREATED_IP"
@@ -423,13 +446,13 @@ else
 fi
 
 # ============ Step 6: Wait for Setup ============
-log_step "Waiting for software installation on VM (takes ~45-60s)..."
-log_info "Compiling optimized dnstt-server + configuring Xray..."
+log_step "Waiting for software installation on VM (takes ~20-30s)..."
+log_info "Installing dnstt-server + Xray core..."
 
 for i in $(seq 1 30); do
     DONE=$(gcloud compute ssh "$VM_NAME" --zone="$DEPLOYED_ZONE" --project="$PROJECT_ID" \
         --command="test -f /tmp/slowdns-setup-done && echo YES || echo NO" \
-        --quiet --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o ConnectTimeout=5" 2>/dev/null || echo "NO")
+        --quiet --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o ConnectTimeout=5" < /dev/null 2>/dev/null || echo "NO")
     if [ "$DONE" = "YES" ]; then
         log_step "Setup complete! ✅"
         break
@@ -444,7 +467,7 @@ done
 log_step "Verifying services..."
 gcloud compute ssh "$VM_NAME" --zone="$DEPLOYED_ZONE" --project="$PROJECT_ID" \
     --command="systemctl is-active slowdns xray 2>/dev/null; ss -ulpn | grep ':53 ' || true" \
-    --quiet --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o ConnectTimeout=5" 2>/dev/null || true
+    --quiet --ssh-flag="-o StrictHostKeyChecking=no" --ssh-flag="-o ConnectTimeout=5" < /dev/null 2>/dev/null || true
 
 # ============ Step 7: Print Results ============
 VMESS_LINK="vmess://eyJ2IjoiMiIsInBzIjoiR0NQIFNMT1dETlMgVk1FU1MiLCJhZGQiOiIxMjcuMC4wLjEiLCJwb3J0IjoiMTAwODYiLCJpZCI6IjYwYzQ0ZWQyLTRkZDQtNDNhYi05YTY2LWEwYjQwNjIzYTFkNCIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidHlwZSI6Im5vbmUiLCJob3N0IjoiIiwicGF0aCI6IiIsInRscyI6IiIsInNuaSI6IiIsImFscG4iOiIifQ=="
