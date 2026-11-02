@@ -385,8 +385,8 @@ for ZONE in "${TARGET_ZONES[@]}"; do
         fi
     done
 
-    ERR_SNIP=$(echo "$OUT" | grep -Ei "ERROR|denied|quota|ZONE_RESOURCE|not found" | head -n 1 || true)
-    log_warn "Zone $ZONE unavailable: ${ERR_SNIP:-trying next zone...}"
+    ERR_SNIP=$(echo "$OUT" | grep -A 1 -Ei "ERROR|denied|quota|ZONE_RESOURCE|not found" | tr '\n' ' ' | sed 's/  */ /g' || true)
+    log_warn "Zone $ZONE: ${ERR_SNIP:-trying next zone...}"
 done
 
 # Fallback: check if VM already exists in common zones
